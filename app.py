@@ -1,138 +1,105 @@
-import numpy as np
+import datetime
+import math
 import pandas as pd
-import pytz
-import yfinance as yf
-from flask import Flask, render_template, request, jsonify
+import numpy as np
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 
-app = Flask(__name__)
+from data_retriever import get_stock_data, get_latest_price
+from strategy import get_signals
 
-# 预定义需要跟踪的美股股票列表（去掉 FB，或改为 META 等）
-STOCKS = ["AAPL", "GOOGL", "AMZN", "TSLA", "MSFT", "NFLX", "NVDA", "INTC", "AMD"]
+app = FastAPI(title="美股量化交易系统")
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# 时区映射，可根据需要扩展更多选项
-TIMEZONE_MAPPING = {
-    "1": "America/New_York",   # 纽约
-    "2": "America/Vancouver"   # 温哥华
-}
+# 关注列表
+watchlist = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'TSLA', 'META', 'NFLX', 'NVDA', 'BABA', 'INTC']
 
-def get_stock_data(ticker, interval, tz, period="1d"):
-    """
-    使用 yfinance 获取单个股票的历史数据，并转换到指定时区。
-    period 参数：当使用分钟级别的数据时建议使用 "1d"，否则可以扩展为 "7d" 或更长。
-    """
-    try:
-        data = yf.download(ticker, period=period, interval=interval, auto_adjust=False)
-        if data.empty:
-            return None
-        
-        # 检查索引是否已有时区，如果没有则本地化为UTC
-        if data.index.tz is None:
-            data.index = data.index.tz_localize('UTC')
-        # 转换到指定时区
-        data.index = data.index.tz_convert(tz)
-        
-        # 重置索引到普通列
-        data.reset_index(inplace=True)
-        
-        # 如果是多级索引（MultiIndex），只取第一级
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        else:
-            # 将所有列名转换为字符串，避免 JSON 序列化时的 tuple 键报错
-            data.columns = data.columns.map(str)
-        
-        # 将时间列转换为字符串
-        data['Datetime'] = data['Datetime'].astype(str)
-        return data
-    except Exception as e:
-        print(f"获取 {ticker} 数据出错：{e}")
+def convert_value(val):
+    """递归将 NaN 转成 None，并把 numpy 类型转换为 Python 原生类型。"""
+    if isinstance(val, float) and math.isnan(val):
         return None
+    if isinstance(val, np.generic):
+        val = val.item()
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        return val
+    if isinstance(val, list):
+        return [convert_value(x) for x in val]
+    if isinstance(val, dict):
+        return {str(k): convert_value(v) for k, v in val.items()}
+    return val
 
-def compute_signals(df):
-    """
-    根据均线交叉策略计算买卖信号
-    使用 5 日均线和 20 日均线进行判断：
-      - 当上一时刻短期均线 <= 长期均线，而当前时刻短期均线 > 长期均线 => 买入
-      - 当上一时刻短期均线 >= 长期均线，而当前时刻短期均线 < 长期均线 => 卖出
-      - 其它情况 => 观望
-    """
-    short_window = 5
-    long_window = 20
-    
-    # 数据不足时无法计算均线，默认信号为“观望”
-    if len(df) < long_window:
-        return df, "观望", []
-    
-    # 计算均线
-    df['MA_short'] = df['Close'].rolling(window=short_window).mean()
-    df['MA_long']  = df['Close'].rolling(window=long_window).mean()
-    
-    signals = []
-    current_signal = "观望"
-    
-    for i in range(long_window, len(df)):
-        prev_short = df['MA_short'].iat[i-1]
-        prev_long  = df['MA_long'].iat[i-1]
-        if pd.isna(prev_short) or pd.isna(prev_long):
-            continue
-        curr_short = df['MA_short'].iat[i]
-        curr_long  = df['MA_long'].iat[i]
-        
-        if prev_short <= prev_long and curr_short > curr_long:
-            signals.append({"index": i, "signal": "买入"})
-            current_signal = "买入"
-        elif prev_short >= prev_long and curr_short < curr_long:
-            signals.append({"index": i, "signal": "卖出"})
-            current_signal = "卖出"
-    
-    return df, current_signal, signals
+def convert_records(records):
+    """对每条记录做 convert_value 转换。"""
+    new_records = []
+    for r in records:
+        new_records.append({str(k): convert_value(v) for k, v in r.items()})
+    return new_records
 
-@app.route("/")
-def index():
-    return render_template("index.html", stocks=STOCKS)
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "watchlist": watchlist})
 
-@app.route("/data")
-def data():
-    # 从前端获取 interval / tz 参数
-    interval = request.args.get("interval", "1m")
-    tz_option = request.args.get("tz", "1")
-    tz = TIMEZONE_MAPPING.get(tz_option, "America/New_York")
-    
-    # 根据间隔选择查询周期
-    # 分钟级用 "1d"，小时级或日级可以用更长周期
-    if interval in ["1m", "5m", "15m", "10m"]:
-        period = "1d"
-    else:
-        period = "7d"
-    
-    all_data = {}
-    
-    for ticker in STOCKS:
-        df = get_stock_data(ticker, interval, tz, period)
-        # 如果下载失败或为空，跳过
-        if df is None or df.empty:
-            continue
-        
-        # 计算信号
-        df, current_signal, signals = compute_signals(df)
-        
-        # 将 NaN/Inf 替换为 None，避免 JSON 序列化错误
-        df.replace({np.nan: None, np.inf: None, -np.inf: None}, inplace=True)
-        
-        # 获取最新价格（最后一行 Close）
-        last_price = None
-        if len(df) > 0 and df['Close'].iat[-1] is not None:
-            last_price = float(df['Close'].iat[-1])
-        
-        all_data[ticker] = {
-            "data": df.to_dict(orient="list"),
-            "current_signal": current_signal,
-            "signals": signals,
-            "last_price": last_price
-        }
-    
-    return jsonify(all_data)
+@app.get("/api/data")
+async def api_data(symbol: str, interval: str = "1m"):
+    try:
+        end = datetime.datetime.now()
+        start = end - datetime.timedelta(days=5)
 
-if __name__ == "__main__":
-    # 启动 Flask
-    app.run(debug=True)
+        # 获取数据
+        df = get_stock_data(symbol, start, end, interval)
+        if df.empty:
+            raise HTTPException(status_code=404, detail="未获取到数据")
+
+        # 计算策略信号
+        df = get_signals(df)
+
+        # 如果存在多级列，则降级为单级列
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # 如果存在日期字段，转换为字符串格式
+        if 'Datetime' in df.columns:
+            df['Datetime'] = df['Datetime'].astype(str)
+
+        # 将所有 NaN 值替换为 None
+        df = df.where(pd.notnull(df), None)
+
+        # 将 DataFrame 转换为字典列表，并递归转换数据类型
+        records = df.to_dict(orient="records")
+        records = convert_records(records)
+
+        # 判断最新信号
+        latest_signal = df['Position'].iloc[-1]
+        if latest_signal == 1:
+            signal_text = "买入信号"
+        elif latest_signal == -1:
+            signal_text = "卖出信号"
+        else:
+            signal_text = "观望"
+
+        return {"data": records, "signal": signal_text}
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/api/watchlist")
+async def api_watchlist():
+    try:
+        results = []
+        for symbol in watchlist:
+            price = get_latest_price(symbol)
+            # 在此打印，看看是什么
+            print(f"symbol={symbol}, price={price}, type={type(price)}")
+            results.append({"symbol": symbol, "price": price})
+        return {"watchlist": results}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
