@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>美股量化交易系统</title>
+  <!-- 使用明确版本的 Plotly，避免使用 plotly-latest.min.js -->
+  <script src="https://cdn.plot.ly/plotly-2.20.0.min.js"></script>
+  <style>
+    body {
+      font-family: "Microsoft YaHei", sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      display: flex;
+      flex-direction: row;
+      height: 100vh;
+    }
+    .chart-panel {
+      flex: 3; /* 左侧图表区域 */
+      border-right: 1px solid #ccc;
+      padding: 10px;
+    }
+    .watchlist-panel {
+      flex: 1; /* 右侧关注列表区域 */
+      padding: 10px;
+      overflow-y: auto;
+    }
+    .control-panel {
+      margin-bottom: 10px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+    table thead {
+      background: #f0f0f0;
+    }
+    table th, table td {
+      border: 1px solid #ccc;
+      padding: 8px;
+      text-align: left;
+      cursor: pointer;
+    }
+    table tr:hover {
+      background: #e8f5ff;
+    }
+    .chart-container {
+      width: 100%;
+      height: calc(100% - 60px); /* 预留控制栏高度 */
+    }
+    #chart {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- 左侧图表区域 -->
+    <div class="chart-panel">
+      <div class="control-panel">
+        <label for="interval">数据间隔：</label>
+        <select id="interval">
+          <option value="1m">1分钟</option>
+          <option value="5m">5分钟</option>
+          <option value="15m">15分钟</option>
+          <option value="1h">1小时</option>
+        </select>
+        
+        <label for="tz">时区：</label>
+        <select id="tz">
+          <option value="1">纽约</option>
+          <option value="2">温哥华</option>
+        </select>
+        
+        <label for="showSignals">
+          <input type="checkbox" id="showSignals" checked />
+          显示买卖信号
+        </label>
+        
+        <button onclick="updateData()">更新数据</button>
+      </div>
+      <div class="chart-container">
+        <div id="chart"></div>
+      </div>
+    </div>
+    
+    <!-- 右侧关注列表 -->
+    <div class="watchlist-panel">
+      <h3>关注列表</h3>
+      <table id="watchlistTable">
+        <thead>
+          <tr>
+            <th>股票</th>
+            <th>最新价格</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- 这里通过 JS 动态填充 -->
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    // 从后端传来的预定义股票列表
+    let stocks = {{ stocks | tojson }};
+    // 用于存储后端返回的全部数据
+    let allData = {};
+    // 当前选中的股票，默认选第一只
+    let selectedStock = stocks.length > 0 ? stocks[0] : null;
+
+    // 页面加载完后，先获取数据
+    window.onload = function() {
+      updateData();
+      // 每隔 60 秒自动刷新数据
+      setInterval(updateData, 60000);
+    };
+
+    // 主函数：向后端请求最新数据
+    function updateData(){
+      let interval = document.getElementById("interval").value;
+      let tz = document.getElementById("tz").value;
+      fetch(`/data?interval=${interval}&tz=${tz}`)
+        .then(response => response.json())
+        .then(data => {
+          allData = data;
+          // 更新关注列表
+          renderWatchlist();
+          // 如果当前选中的股票还在列表中，就刷新图表；否则换一个
+          if(!allData[selectedStock]) {
+            // 如果之前选的股票不在返回数据里了，就选第一个可用的
+            let availableTickers = Object.keys(allData);
+            if(availableTickers.length > 0) {
+              selectedStock = availableTickers[0];
+            }
+          }
+          if(selectedStock) {
+            drawChartForStock(selectedStock);
+          }
+        })
+        .catch(err => {
+          console.error("获取数据出错：", err);
+        });
+    }
+
+    // 渲染右侧关注列表
+    function renderWatchlist() {
+      let tbody = document.querySelector("#watchlistTable tbody");
+      tbody.innerHTML = ""; // 清空旧内容
+      
+      // 遍历 allData，创建行
+      for(let ticker in allData) {
+        let row = document.createElement("tr");
+        
+        let cellTicker = document.createElement("td");
+        cellTicker.textContent = ticker;
+        // 点击行时切换图表
+        cellTicker.onclick = () => {
+          selectedStock = ticker;
+          drawChartForStock(ticker);
+        };
+        
+        let cellPrice = document.createElement("td");
+        let price = allData[ticker].last_price;
+        cellPrice.textContent = (price !== null && price !== undefined) ? price.toFixed(2) : "N/A";
+        // 整行点击也可以切换，这里只做第一列点击
+        // 你也可以 cellPrice.onclick = ...
+        
+        row.appendChild(cellTicker);
+        row.appendChild(cellPrice);
+        tbody.appendChild(row);
+      }
+    }
+
+    // 绘制单只股票的图表
+    function drawChartForStock(ticker) {
+      let stockData = allData[ticker];
+      if(!stockData) return;
+
+      let df = stockData.data;
+      let times = df["Datetime"];
+      let opens = df["Open"];
+      let highs = df["High"];
+      let lows  = df["Low"];
+      let closes = df["Close"];
+      
+      // 构建K线（蜡烛图）trace
+      let candleTrace = {
+        x: times,
+        open: opens,
+        high: highs,
+        low: lows,
+        close: closes,
+        type: 'candlestick',
+        name: ticker
+      };
+      
+      // 是否显示买卖信号
+      let showSignals = document.getElementById("showSignals").checked;
+      let signalTraces = [];
+      if(showSignals) {
+        // 解析后端返回的 signals
+        let signals = stockData.signals; // {index, signal}
+        let buy_x = [], buy_y = [];
+        let sell_x = [], sell_y = [];
+        
+        signals.forEach(s => {
+          let idx = s.index;
+          // 注意：需要确保 idx 不越界
+          if(idx < times.length) {
+            let xVal = times[idx];
+            let yVal = closes[idx];
+            if(s.signal === "买入") {
+              buy_x.push(xVal);
+              buy_y.push(yVal);
+            } else if(s.signal === "卖出") {
+              sell_x.push(xVal);
+              sell_y.push(yVal);
+            }
+          }
+        });
+        
+        let buyTrace = {
+          x: buy_x,
+          y: buy_y,
+          mode: 'markers',
+          marker: { size: 12, symbol: 'triangle-up', color: 'green' },
+          name: '买入信号'
+        };
+        let sellTrace = {
+          x: sell_x,
+          y: sell_y,
+          mode: 'markers',
+          marker: { size: 12, symbol: 'triangle-down', color: 'red' },
+          name: '卖出信号'
+        };
+        
+        signalTraces.push(buyTrace, sellTrace);
+      }
+      
+      let layout = {
+        title: `${ticker} (当前信号：${stockData.current_signal || '无'})`,
+        xaxis: { title: '时间' },
+        yaxis: { title: '价格' },
+        font: { family: 'Microsoft YaHei, sans-serif' }
+      };
+      
+      let plotData = [candleTrace, ...signalTraces];
+      Plotly.newPlot('chart', plotData, layout);
+    }
+  </script>
+</body>
+</html>
